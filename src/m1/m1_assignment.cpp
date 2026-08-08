@@ -32,24 +32,6 @@ SOFTWARE.
 extern "C"
 {
 
-/*int ss_nvme_device_io_with_mdts(int fd, uint32_t nsid, uint64_t slba, uint16_t numbers, void *buffer, uint64_t buf_size,
-                                uint64_t lba_size, uint64_t mdts_size, bool read){
-    int ret = -ENOSYS;
-    // this is to supress gcc warnings, remove it when you complete this function 
-    UNUSED(fd);
-    UNUSED(nsid);
-    UNUSED(slba);
-    UNUSED(numbers);
-    UNUSED(buffer);
-    UNUSED(buf_size);
-    UNUSED(lba_size);
-    UNUSED(mdts_size);
-    UNUSED(read);
-
-    return ret;
-}
-*/
-
 int ss_nvme_device_io_with_mdts(
     int fd,
     uint32_t nsid,
