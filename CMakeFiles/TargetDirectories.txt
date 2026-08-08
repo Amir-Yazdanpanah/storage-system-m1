@@ -1,0 +1,10 @@
+/home/amir/msc-stosys-skeleton/CMakeFiles/install/strip.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/install.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/list_install_components.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/rebuild_cache.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/edit_cache.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/m3.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/install/local.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/m2.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/stosys.dir
+/home/amir/msc-stosys-skeleton/CMakeFiles/m1.dir

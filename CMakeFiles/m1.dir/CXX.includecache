@@ -1,0 +1,28 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/amir/msc-stosys-skeleton/src/common/unused.h
+
+/home/amir/msc-stosys-skeleton/src/m1/m1_assignment.cpp
+assert.h
+-
+errno.h
+-
+stdio.h
+-
+m1_assignment.h
+/home/amir/msc-stosys-skeleton/src/m1/m1_assignment.h
+../common/unused.h
+/home/amir/msc-stosys-skeleton/src/common/unused.h
+stdarg.h
+-
+
+/home/amir/msc-stosys-skeleton/src/m1/m1_assignment.h
+libnvme.h
+-
+
