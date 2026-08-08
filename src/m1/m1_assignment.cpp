@@ -177,7 +177,6 @@ int ss_zns_device_zone_reset(int fd, uint32_t nsid, uint64_t slba) {
     return ret;
 }
 
-// this does not take slba because it will return that
 int ss_zns_device_zone_append(int fd, uint32_t nsid, uint64_t zslba, int numbers, void *buffer, uint32_t buf_size, uint64_t *written_slba){
     if (fd < 0 || buffer == nullptr || numbers <= 0) {
 	return -EINVAL;
@@ -207,39 +206,24 @@ void update_lba(uint64_t &write_lba, const uint32_t lba_size, const int count){
     write_lba += count;
 }
 
-// see 5.15.2.2 Identify Controller data structure (CNS 01h)
-// see how to pass any number of variables in a C/C++ program https://stackoverflow.com/questions/1579719/variable-number-of-parameters-in-function-in-c
-// feel free to pass any relevant function parameter to this function extract MDTS 
-// you must return the MDTS as the return value of this function 
-/*uint64_t get_mdts_size(int count, ...){    
-    UNUSED(count);
-    //FIXME 
-    return 4096;
-}*/
-
-uint64_t get_mdts_size(int count, ...)
-{
-    // We expect one additional argument:
-    // the NVMe device file descriptor.
+uint64_t get_mdts_size(int count, ...) {
     if (count < 1) {
         return 0;
     }
 
     va_list args;
     va_start(args, count);
-
     int fd = va_arg(args, int);
-
     va_end(args);
 
     if (fd < 0) {
         return 0;
     }
 
-    // Identify Controller data structure
+    // identify controller data structure
     struct nvme_id_ctrl ctrl = {};
 
-    // Ask the NVMe controller for its Identify Controller data.
+    // ask the NVMe controller for its identify controller data.
     int ret = nvme_identify_ctrl(fd, &ctrl);
 
     if (ret != 0) {
@@ -247,17 +231,8 @@ uint64_t get_mdts_size(int count, ...)
         return 0;
     }
 
-    // mdts is an exponent.
-    //
-    // Maximum Data Transfer Size =
-    //
-    //     2^mdts * minimum memory page size
-    //
-    // Our system page size is 4096 bytes.
     uint64_t page_size = 4096;
-
-    uint64_t mdts_size =
-        (1ULL << ctrl.mdts) * page_size;
+    uint64_t mdts_size = (1ULL << ctrl.mdts) * page_size;
 
     printf("NVMe controller MDTS field = %u\n", ctrl.mdts);
     printf("Maximum Data Transfer Size = %lu bytes\n", mdts_size);
