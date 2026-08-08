@@ -52,63 +52,33 @@ int ss_nvme_device_io_with_mdts(
         return -EINVAL;
     }
 
-    /*
-     * The buffer must contain exactly 'numbers' LBAs.
-     */
     if (buf_size != static_cast<uint64_t>(numbers) * lba_size) {
         return -EINVAL;
     }
 
-    /*
-     * Calculate how many LBAs can fit into one
-     * command without exceeding MDTS.
-     */
     uint64_t max_lbas_per_command = mdts_size / lba_size;
 
     if (max_lbas_per_command == 0) {
         return -EINVAL;
     }
 
-    /*
-     * nvme_read()/nvme_write() use a 16-bit NLB field.
-     * NLB is zero-based, so the largest representable
-     * transfer is 65536 LBAs (NLB = 65535).
-     */
+    // nvme_read()/nvme_write() use a 16-bit NLB field.
+    // NLB is zero-based, so the largest representable
+    // transfer is 65536 LBAs (NLB = 65535).
     if (max_lbas_per_command > 65536) {
         max_lbas_per_command = 65536;
     }
 
     uint64_t lbas_remaining = numbers;
-
     uint64_t current_slba = slba;
-
-    uint8_t *current_buffer =
-        static_cast<uint8_t *>(buffer);
+    uint8_t *current_buffer = static_cast<uint8_t *>(buffer);
 
     while (lbas_remaining > 0) {
+        uint64_t lbas_this_command = (lbas_remaining > max_lbas_per_command) ? max_lbas_per_command : lbas_remaining;
+        uint64_t bytes_this_command = lbas_this_command * lba_size;
 
-        /*
-         * Decide how many LBAs this iteration will handle.
-         */
-        uint64_t lbas_this_command =
-            (lbas_remaining > max_lbas_per_command)
-                ? max_lbas_per_command
-                : lbas_remaining;
-
-        /*
-         * Number of bytes belonging to this chunk.
-         */
-        uint64_t bytes_this_command =
-            lbas_this_command * lba_size;
-
-        /*
-         * Call the wrapper functions that you already
-         * implemented.
-         */
         int ret;
-
         if (read) {
-
             ret = ss_nvme_device_read(
                 fd,
                 nsid,
@@ -117,9 +87,7 @@ int ss_nvme_device_io_with_mdts(
                 current_buffer,
                 bytes_this_command
             );
-
         } else {
-
             ret = ss_nvme_device_write(
                 fd,
                 nsid,
@@ -130,35 +98,20 @@ int ss_nvme_device_io_with_mdts(
             );
         }
 
-        /*
-         * Stop immediately if this chunk failed.
-         */
         if (ret != 0) {
-            printf(
-                "ERROR: %s failed at SLBA 0x%lx, "
-                "numbers = %lu, ret = %d\n",
-                read ? "read" : "write",
-                current_slba,
-                lbas_this_command,
-                ret
-            );
+            printf("Erorr: %s failed at SLBA 0x%lx, numbers = %lu, ret = %d\n", read ? "read" : "write", current_slba, lbas_this_command, ret);
 
             return ret;
         }
 
-        /*
-         * Move to the next chunk.
-         */
+        // next chunk
         current_slba += lbas_this_command;
-
         current_buffer += bytes_this_command;
-
         lbas_remaining -= lbas_this_command;
     }
 
     return 0;
 }
-
 
 int ss_nvme_device_read(int fd, uint32_t nsid, uint64_t slba, uint16_t numbers, void *buffer, uint64_t buf_size) {
     if (fd < 0 || buffer == nullptr || numbers ==0) {
