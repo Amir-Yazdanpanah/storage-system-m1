@@ -100,7 +100,6 @@ int ss_nvme_device_io_with_mdts(
 
         if (ret != 0) {
             printf("Erorr: %s failed at SLBA 0x%lx, numbers = %lu, ret = %d\n", read ? "read" : "write", current_slba, lbas_this_command, ret);
-
             return ret;
         }
 
