@@ -23,53 +23,61 @@ SOFTWARE.
 #include "zns_device.h"
 
 #include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <stdexcept>
+#include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include <unistd.h>
 
 namespace {
 
-// Only translation metadata is stored here. User data is never cached.
-struct data_zone_mapping {
-    uint64_t physical_start;
-    bool used;
-};
-
 struct ftl_state {
-    int fd;
-    uint32_t nsid;
-    uint32_t lba_bytes;
-    uint64_t zone_size_lbas;     // Distance between physical zone starts.
-    uint64_t zone_capacity_lbas; // Writable LBAs, which can be less than size.
-    uint64_t log_capacity_lbas;
-    uint64_t log_used_lbas;
-    uint32_t max_active_zones;  // NVMe's zero-based MAR; UINT32_MAX = unlimited.
-    int write_error;
-    std::unordered_map<uint64_t, uint64_t> page_map;
-    std::vector<data_zone_mapping> zone_map;
-    std::mutex mutex;
+    int fd = -1;
+    uint32_t nsid = 0;
+    uint32_t lba_bytes = 0;
+    uint64_t zone_size_lbas = 0;     // Physical distance between zone starts.
+    uint64_t zone_capacity_lbas = 0; // Writable pages per zone, not zone size.
+    uint32_t max_active_zones = 0;   // NVMe MAR: zero based, UINT32_MAX unlimited.
 
-    ftl_state() : fd(-1), nsid(0), lba_bytes(0), zone_size_lbas(0),
-        zone_capacity_lbas(0), log_capacity_lbas(0), log_used_lbas(0),
-        max_active_zones(0), write_error(0) {}
+    std::unordered_map<uint64_t, uint64_t> page_map; // Logical page -> log LBA.
+    std::vector<uint64_t> zone_map;                // Logical zone -> data start.
+    std::vector<uint64_t> log_used;                // Used pages in each log zone.
+    uint64_t spare_zone = 0;                       // Empty GC destination.
+    int active_log = -1;
+    bool active_open = false;
+    int gc_wmark = 1;
+    uint64_t gc_events = 0;
+    size_t next_victim = 0;
+    int error = 0;
+    bool stopping = false;
+
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::thread gc_thread;
+    std::vector<unsigned char> copy_buffer; // One-page GC scratch, not a cache.
 
     ~ftl_state() {
-        if (fd >= 0) {
-            close(fd);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+            changed.notify_all();
         }
+        if (gc_thread.joinable()) gc_thread.join();
+        if (fd >= 0) close(fd);
     }
 };
 
 int command_result(int result) {
-    // libnvme returns an NVMe status (> 0), or -1 with errno on syscall errors.
     return result == -1 ? -(errno != 0 ? errno : EIO) : result;
 }
 
@@ -81,54 +89,150 @@ int validate_io(user_zns_device *device, uint64_t address, const void *buffer,
     }
     if (address % device->lba_size_bytes != 0 ||
         size % device->lba_size_bytes != 0 ||
-        address > device->capacity_bytes ||
-        size > device->capacity_bytes - address) {
+        address > device->capacity_bytes || size > device->capacity_bytes - address) {
         return -EINVAL;
     }
     return 0;
 }
 
 int read_page(ftl_state &state, uint64_t physical_lba, void *buffer) {
-    // NLB is zero based: 0 means exactly one LBA. One-page transfers are
-    // deliberately conservative, satisfying MDTS without reading PCI BARs.
+    // NLB is zero based: 0 means one LBA. This conservatively respects MDTS.
     return command_result(nvme_read(state.fd, state.nsid, physical_lba,
         0, 0, 0, 0, 0, 0, state.lba_bytes, buffer, 0, nullptr));
 }
 
 int write_page(ftl_state &state, uint64_t physical_lba, void *buffer) {
-    const int result = command_result(nvme_write(state.fd, state.nsid,
-        physical_lba, 0, 0, 0, 0, 0, 0, 0, state.lba_bytes, buffer, 0, nullptr));
-    if (result != 0) {
-        // A failed command can leave the hardware write pointer uncertain.
-        // Do not reuse that physical address or publish a speculative map.
-        state.write_error = result;
-    }
-    return result;
+    return command_result(nvme_write(state.fd, state.nsid, physical_lba,
+        0, 0, 0, 0, 0, 0, 0, state.lba_bytes, buffer, 0, nullptr));
 }
 
-bool can_write_data_zone(const ftl_state &state, uint64_t logical_lba,
-                         uint64_t pages_left, uint64_t log_used_lbas) {
-    const uint64_t capacity = state.zone_capacity_lbas;
-    if (logical_lba % capacity != 0 || pages_left < capacity ||
-        state.zone_map[logical_lba / capacity].used) {
-        return false;
-    }
-    // A partially filled log is an active zone even after being closed.
-    // A controller permitting only one active zone cannot open a data zone
-    // until that log is full. In that case retain the page-log path.
-    return state.max_active_zones != 0 || log_used_lbas % capacity == 0;
+int zone_command(ftl_state &state, uint64_t start, nvme_zns_send_action action) {
+    return command_result(nvme_zns_mgmt_send(state.fd, state.nsid, start,
+        false, action, 0, nullptr));
 }
 
-int prepare_data_zone(ftl_state &state) {
-    if (state.log_used_lbas % state.zone_capacity_lbas == 0) {
-        return 0;
+uint64_t physical_page(const ftl_state &state, uint64_t logical_lba) {
+    const auto entry = state.page_map.find(logical_lba);
+    if (entry != state.page_map.end()) return entry->second;
+    return state.zone_map[logical_lba / state.zone_capacity_lbas] +
+        logical_lba % state.zone_capacity_lbas;
+}
+
+int free_logs(const ftl_state &state) {
+    int count = 0;
+    for (size_t index = 0; index < state.log_used.size(); ++index) {
+        if (state.log_used[index] == 0 && static_cast<int>(index) != state.active_log) {
+            ++count;
+        }
     }
-    // Keep at most one OPEN zone: close a partial log before opening data.
-    // A subsequent sequential write implicitly reopens this log zone.
-    const uint64_t log_start = (state.log_used_lbas /
-        state.zone_capacity_lbas) * state.zone_size_lbas;
-    return command_result(nvme_zns_mgmt_send(state.fd, state.nsid, log_start,
-        false, NVME_ZNS_ZSA_CLOSE, 0, nullptr));
+    return count;
+}
+
+int full_log(const ftl_state &state) {
+    for (size_t offset = 0; offset < state.log_used.size(); ++offset) {
+        const size_t index = (state.next_victim + offset) % state.log_used.size();
+        if (state.log_used[index] == state.zone_capacity_lbas) {
+            return static_cast<int>(index);
+        }
+    }
+    return -1;
+}
+
+// Keep just one zone OPEN. A partially written, closed log is still ACTIVE.
+int make_room_for_merge(ftl_state &state) {
+    if (state.active_log < 0) return 0;
+    const uint64_t start = state.active_log * state.zone_size_lbas;
+    if (state.max_active_zones == 0) {
+        // With a one-active-zone controller, finish the partial log before
+        // opening the spare. Its unused tail is discarded, never live data.
+        const int result = zone_command(state, start, NVME_ZNS_ZSA_FINISH);
+        if (result != 0) return result;
+        state.log_used[state.active_log] = state.zone_capacity_lbas;
+        state.active_log = -1;
+        state.active_open = false;
+    } else if (state.active_open) {
+        const int result = zone_command(state, start, NVME_ZNS_ZSA_CLOSE);
+        if (result != 0) return result;
+        state.active_open = false;
+    }
+    return 0;
+}
+
+// Called only by the GC thread, with the mutex held for ONE logical-zone merge.
+int merge_data_zone(ftl_state &state, uint64_t logical_zone) {
+    int result = make_room_for_merge(state);
+    if (result != 0) return result;
+    const uint64_t first_lba = logical_zone * state.zone_capacity_lbas;
+    const uint64_t old_data_zone = state.zone_map[logical_zone];
+    for (uint64_t page = 0; page < state.zone_capacity_lbas; ++page) {
+        result = read_page(state, physical_page(state, first_lba + page),
+                           state.copy_buffer.data());
+        if (result != 0) return result;
+        result = write_page(state, state.spare_zone + page, state.copy_buffer.data());
+        if (result != 0) return result;
+    }
+    // The old data zone is intact until the complete new version is on device.
+    state.zone_map[logical_zone] = state.spare_zone;
+    for (uint64_t page = 0; page < state.zone_capacity_lbas; ++page) {
+        state.page_map.erase(first_lba + page);
+    }
+    result = zone_command(state, old_data_zone, NVME_ZNS_ZSA_RESET);
+    if (result != 0) return result;
+    state.spare_zone = old_data_zone;
+    return 0;
+}
+
+void garbage_collector(ftl_state *state) {
+    try {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        int victim = -1;
+        while (true) {
+            state->changed.wait(lock, [&]() {
+                return state->stopping || state->error != 0 || victim >= 0 ||
+                    (free_logs(*state) + 1 <= state->gc_wmark && full_log(*state) >= 0);
+            });
+            if (state->stopping || state->error != 0) return;
+            if (victim < 0) {
+                victim = full_log(*state);
+                state->next_victim = (victim + 1) % state->log_used.size();
+            }
+
+            // Find one logical zone with a latest page in this sealed log.
+            // Stale physical copies do not have page-map entries and need no copy.
+            bool found = false;
+            uint64_t logical_zone = 0;
+            for (const auto &entry : state->page_map) {
+                if (entry.second / state->zone_size_lbas == static_cast<uint64_t>(victim)) {
+                    logical_zone = entry.first / state->zone_capacity_lbas;
+                    found = true;
+                    break;
+                }
+            }
+            int result;
+            if (found) {
+                result = merge_data_zone(*state, logical_zone);
+            } else {
+                // All latest pages have safe data-zone or other-log versions.
+                result = zone_command(*state, victim * state->zone_size_lbas,
+                                      NVME_ZNS_ZSA_RESET);
+                if (result == 0) {
+                    state->log_used[victim] = 0;
+                    ++state->gc_events;
+                    victim = -1;
+                }
+            }
+            if (result != 0) state->error = result;
+            state->changed.notify_all();
+            // Give user I/O a chance between merges, not only after draining a log.
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+        }
+    } catch (const std::exception &) {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->error = -EIO;
+        state->changed.notify_all();
+    }
 }
 
 int discover_geometry(ftl_state &state, const zdev_init_params &params,
@@ -230,13 +334,13 @@ int discover_geometry(ftl_state &state, const zdev_init_params &params,
     }
     state.zone_map.resize(static_cast<size_t>(data_zones));
     for (uint64_t index = 0; index < data_zones; ++index) {
-        state.zone_map[index].physical_start =
-            (index + params.log_zones) * state.zone_size_lbas;
-        state.zone_map[index].used = false;
+        state.zone_map[index] = (index + params.log_zones) * state.zone_size_lbas;
     }
-    // M2 has no persistent metadata. All requested log zones are available;
-    // M5 will need to reserve a metadata zone and adjust this policy.
-    state.log_capacity_lbas = params.log_zones * state.zone_capacity_lbas;
+    // One overhead zone is a rotating, empty destination for safe GC merges.
+    state.spare_zone = (params.log_zones - 1) * state.zone_size_lbas;
+    state.log_used.assign(static_cast<size_t>(params.log_zones - 1), 0);
+    state.gc_wmark = params.gc_wmark;
+    state.copy_buffer.resize(state.lba_bytes);
     device.lba_size_bytes = state.lba_bytes;
     device.capacity_bytes = data_zones * capacity_bytes;
     device.tparams.zns_lba_size = state.lba_bytes;
@@ -250,43 +354,27 @@ int discover_geometry(ftl_state &state, const zdev_init_params &params,
 extern "C" {
 
 int init_ss_zns_device(zdev_init_params *params, user_zns_device **my_dev) {
-    if (my_dev == nullptr) {
-        return -EINVAL;
-    }
+    if (my_dev == nullptr) return -EINVAL;
     *my_dev = nullptr;
     if (params == nullptr || params->name == nullptr || params->name[0] == '\0' ||
-        params->log_zones < 3 || params->gc_wmark < 0) {
+        params->log_zones < 3 || params->gc_wmark < 1 ||
+        params->gc_wmark >= params->log_zones) {
         return -EINVAL;
     }
-    // Volatile maps cannot be recovered safely. Never pretend to resume, and
-    // never reset a namespace when the caller explicitly requested resume.
-    if (!params->force_reset) {
-        return -EOPNOTSUPP;
-    }
+    if (!params->force_reset) return -EOPNOTSUPP; // Persistence is Milestone 5.
     try {
         std::unique_ptr<user_zns_device> device(new user_zns_device());
         std::unique_ptr<ftl_state> state(new ftl_state());
-        // Legacy nvme_open expects a basename; also accept the public API's
-        // documented /dev/nvmeXnY format when called without the test driver.
         const char *name = params->name;
-        if (std::strncmp(name, "/dev/", 5) == 0) {
-            name += 5;
-        }
+        if (std::strncmp(name, "/dev/", 5) == 0) name += 5;
         state->fd = nvme_open(name);
-        if (state->fd < 0) {
-            return -(errno != 0 ? errno : EIO);
-        }
+        if (state->fd < 0) return -(errno != 0 ? errno : EIO);
         int result = discover_geometry(*state, *params, *device);
-        if (result != 0) {
-            return result;
-        }
-        // Destructive reset is performed only after geometry and allocations
-        // are validated, and only when explicitly requested by force_reset.
+        if (result != 0) return result;
         result = command_result(nvme_zns_mgmt_send(state->fd, state->nsid,
             0, true, NVME_ZNS_ZSA_RESET, 0, nullptr));
-        if (result != 0) {
-            return result;
-        }
+        if (result != 0) return result;
+        state->gc_thread = std::thread(garbage_collector, state.get());
         device->_private = state.release();
         *my_dev = device.release();
         return 0;
@@ -294,110 +382,72 @@ int init_ss_zns_device(zdev_init_params *params, user_zns_device **my_dev) {
         return -ENOMEM;
     } catch (const std::length_error &) {
         return -EOVERFLOW;
+    } catch (const std::system_error &) {
+        return -EAGAIN;
     }
 }
 
 int zns_udevice_read(user_zns_device *my_dev, uint64_t address, void *buffer,
                      uint32_t size) {
-    const int validation = validate_io(my_dev, address, buffer, size);
-    if (validation != 0 || size == 0) {
-        return validation;
-    }
+    const int result = validate_io(my_dev, address, buffer, size);
+    if (result != 0 || size == 0) return result;
     ftl_state &state = *static_cast<ftl_state *>(my_dev->_private);
     std::lock_guard<std::mutex> lock(state.mutex);
-    const uint64_t first_lba = address / state.lba_bytes;
-    const uint64_t count = size / state.lba_bytes;
     unsigned char *bytes = static_cast<unsigned char *>(buffer);
-    for (uint64_t index = 0; index < count; ++index) {
-        const uint64_t logical_lba = first_lba + index;
-        const auto entry = state.page_map.find(logical_lba);
-        const uint64_t physical_lba = entry != state.page_map.end() ?
-            entry->second :
-            state.zone_map[logical_lba / state.zone_capacity_lbas].physical_start +
-                logical_lba % state.zone_capacity_lbas;
-        const int result = read_page(state, physical_lba,
-            bytes + index * state.lba_bytes);
-        if (result != 0) {
-            return result;
-        }
+    const uint64_t first_lba = address / state.lba_bytes;
+    for (uint64_t page = 0; page < size / state.lba_bytes; ++page) {
+        const int status = read_page(state, physical_page(state, first_lba + page),
+                                     bytes + page * state.lba_bytes);
+        if (status != 0) return status;
     }
     return 0;
 }
 
 int zns_udevice_write(user_zns_device *my_dev, uint64_t address, void *buffer,
                       uint32_t size) {
-    const int validation = validate_io(my_dev, address, buffer, size);
-    if (validation != 0 || size == 0) {
-        return validation;
-    }
+    const int result = validate_io(my_dev, address, buffer, size);
+    if (result != 0 || size == 0) return result;
     ftl_state &state = *static_cast<ftl_state *>(my_dev->_private);
-    std::lock_guard<std::mutex> lock(state.mutex);
-    if (state.write_error != 0) {
-        return state.write_error;
-    }
-    const uint64_t first_lba = address / state.lba_bytes;
-    const uint64_t count = size / state.lba_bytes;
     unsigned char *bytes = static_cast<unsigned char *>(buffer);
-
-    // Preflight space, so ordinary ENOSPC cannot produce a partial write.
-    uint64_t log_pages_needed = 0;
-    for (uint64_t index = 0; index < count;) {
-        if (can_write_data_zone(state, first_lba + index, count - index,
-                                state.log_used_lbas + log_pages_needed)) {
-            index += state.zone_capacity_lbas;
-        } else {
-            ++log_pages_needed;
-            ++index;
-        }
-    }
-    if (log_pages_needed > state.log_capacity_lbas - state.log_used_lbas) {
-        return -ENOSPC; // GC belongs to M3; never erase live data to free space.
-    }
+    const uint64_t first_lba = address / state.lba_bytes;
     try {
-        for (uint64_t index = 0; index < count;) {
-            const uint64_t logical_lba = first_lba + index;
-            if (can_write_data_zone(state, logical_lba, count - index,
-                                    state.log_used_lbas)) {
-                int result = prepare_data_zone(state);
-                if (result != 0) {
-                    return result;
-                }
-                data_zone_mapping &mapping =
-                    state.zone_map[logical_lba / state.zone_capacity_lbas];
-                mapping.used = true; // Never retry a partly written data zone.
-                for (uint64_t page = 0; page < state.zone_capacity_lbas; ++page) {
-                    result = write_page(state, mapping.physical_start + page,
-                        bytes + (index + page) * state.lba_bytes);
-                    if (result != 0) {
-                        return result;
+        for (uint64_t page = 0; page < size / state.lba_bytes; ++page) {
+            std::unique_lock<std::mutex> lock(state.mutex);
+            // Wait for the background worker; the user thread never performs GC.
+            state.changed.wait(lock, [&]() {
+                return state.stopping || state.error != 0 || state.active_log >= 0 ||
+                    free_logs(state) + 1 > state.gc_wmark;
+            });
+            if (state.error != 0) return state.error;
+            if (state.stopping) return -ESHUTDOWN;
+            if (state.active_log < 0) {
+                for (size_t index = 0; index < state.log_used.size(); ++index) {
+                    if (state.log_used[index] == 0) {
+                        state.active_log = static_cast<int>(index);
+                        break;
                     }
                 }
-                // Publish the block version only after all pages are on disk.
-                // It supersedes any older page-log version of this range.
-                for (uint64_t page = 0; page < state.zone_capacity_lbas; ++page) {
-                    state.page_map.erase(logical_lba + page);
-                }
-                index += state.zone_capacity_lbas;
-                continue;
             }
-            const uint64_t physical_lba =
-                (state.log_used_lbas / state.zone_capacity_lbas) *
-                    state.zone_size_lbas +
-                state.log_used_lbas % state.zone_capacity_lbas;
-            // Allocate metadata BEFORE issuing I/O. A failed write must retain
-            // an existing mapping, or remove an uncommitted new entry.
-            auto slot = state.page_map.emplace(logical_lba, uint64_t(0));
-            const int result = write_page(state, physical_lba,
-                bytes + index * state.lba_bytes);
-            if (result != 0) {
-                if (slot.second) {
-                    state.page_map.erase(slot.first);
-                }
-                return result;
+            const int log = state.active_log;
+            const uint64_t physical_lba = log * state.zone_size_lbas + state.log_used[log];
+            const uint64_t logical_lba = first_lba + page;
+            // Allocate metadata before the write; commit it only after success.
+            auto entry = state.page_map.emplace(logical_lba, uint64_t(0));
+            const int status = write_page(state, physical_lba, bytes + page * state.lba_bytes);
+            if (status != 0) {
+                if (entry.second) state.page_map.erase(entry.first);
+                state.error = status; // Do not reuse an uncertain write pointer.
+                state.changed.notify_all();
+                return status;
             }
-            slot.first->second = physical_lba;
-            ++state.log_used_lbas;
-            ++index;
+            entry.first->second = physical_lba;
+            state.active_open = true;
+            if (++state.log_used[log] == state.zone_capacity_lbas) {
+                state.active_log = -1;
+                state.active_open = false;
+            }
+            state.changed.notify_all();
+            // The lock is released on each page, so GC can run during large I/O.
         }
         return 0;
     } catch (const std::bad_alloc &) {
@@ -408,16 +458,24 @@ int zns_udevice_write(user_zns_device *my_dev, uint64_t address, void *buffer,
 }
 
 int deinit_ss_zns_device(user_zns_device *my_dev) {
-    if (my_dev == nullptr || my_dev->_private == nullptr) {
-        return -EINVAL;
-    }
-    // As for close(2), callers must first stop/join threads using this device.
+    if (my_dev == nullptr || my_dev->_private == nullptr) return -EINVAL;
     ftl_state *state = static_cast<ftl_state *>(my_dev->_private);
+    // Callers must stop/join their I/O threads before closing this device.
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->stopping = true;
+        state->changed.notify_all();
+    }
+    state->gc_thread.join();
+    const int worker_error = state->error;
+    std::printf("[stosys-stats] GC reclaimed %llu log zones\n",
+                static_cast<unsigned long long>(state->gc_events));
     const int result = close(state->fd);
     const int saved_errno = errno;
     state->fd = -1;
     delete state;
     delete my_dev;
+    if (worker_error != 0) return worker_error;
     return result == 0 ? 0 : -(saved_errno != 0 ? saved_errno : EIO);
 }
 
