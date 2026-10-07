@@ -10,6 +10,6 @@ CMakeFiles/stosys.dir/src/common/utils.cpp.o: src/common/utils.h
 CMakeFiles/stosys.dir/src/m23-ftl/backup_zns_device_file.cpp.o: src/m23-ftl/backup_zns_device_file.cpp
 CMakeFiles/stosys.dir/src/m23-ftl/backup_zns_device_file.cpp.o: src/m23-ftl/zns_device.h
 
-CMakeFiles/stosys.dir/src/m23-ftl/zns_device.cpp.o: src/common/unused.h
 CMakeFiles/stosys.dir/src/m23-ftl/zns_device.cpp.o: src/m23-ftl/zns_device.cpp
+CMakeFiles/stosys.dir/src/m23-ftl/zns_device.cpp.o: src/m23-ftl/zns_device.h
 
